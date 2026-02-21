@@ -1,0 +1,127 @@
+import pygame
+from uuid import uuid4
+from random import randint
+
+# CONFIG
+particle_size = 5
+grid_size = 20
+grid_color = (176, 198, 245)
+background_color = (6, 23, 59)
+
+class grid:
+    def __init__(self, x, y, bcol, fcol, lineres, objects = {}):
+        self.x = x
+        self.y = y
+        self.bcol = bcol
+        self.fcol = fcol
+        self.lineres = lineres # how many squares between each gridline
+        self.objects = objects
+
+    def draw(self, surface):
+        # draw the background
+        surface.fill(self.bcol)
+
+        # draw the grid lines
+        for i in range(0, self.x, self.lineres):
+            pygame.draw.line(surface, self.fcol, (i, 0), (i, self.y))
+        for j in range(0, self.y, self.lineres):
+            pygame.draw.line(surface, self.fcol, (0, j), (self.x, j))
+        
+        # draw the objects in the grid
+        for obj in self.objects.values():
+            pygame.draw.circle(surface, obj.color, (obj.x, obj.y), particle_size)
+
+    def add_object(self, obj):
+        self.objects[obj.id] = obj
+        return obj.id
+    
+    def remove_object(self, obj_id):
+        if obj_id in self.objects:
+            del self.objects[obj_id]
+
+class particle:
+    def __init__(self, x, y, color, grid_obj, rules = []):
+        self.x = x
+        self.y = y
+        self.color = color
+        self.id = uuid4()
+        self.grid = grid_obj
+        self.rules = rules
+
+    def __draw__(self):
+        return (self.x, self.y, self.color)
+    
+    def step(self):
+        # rules should be a list of dicts with keys:
+        #  'color': target color to match (r,g,b)
+        #  'strength': positive for attraction, negative for repulsion
+        #  'range': maximum distance to consider
+        #  'colorrange': tolerance (r_tol, g_tol, b_tol)
+        # accumulate a simple velocity vector based on nearby particles
+        dx = 0.0
+        dy = 0.0
+
+        for rule in self.rules:
+            target_color = rule.get('color')
+            strength = rule.get('strength', 0.0)
+            maxdist = rule.get('range', float('inf'))
+            tol = rule.get('colorrange', (0,0,0))
+
+            for other in self.nearby(maxdist):
+                orc = other.color
+                if (abs(orc[0] - target_color[0]) <= tol[0] and
+                    abs(orc[1] - target_color[1]) <= tol[1] and
+                    abs(orc[2] - target_color[2]) <= tol[2]):
+                    vx = other.x - self.x
+                    vy = other.y - self.y
+                    dist = (vx*vx + vy*vy) ** 0.5
+                    if dist == 0:
+                        continue
+                    vx /= dist
+                    vy /= dist
+                    dx += vx * strength
+                    dy += vy * strength
+        self.x += dx
+        self.y += dy
+
+    
+
+    def nearby(self, range):
+        nearby_particles = []
+        for obj in self.grid.objects.values():
+            if abs(obj.x - self.x) <= range and abs(obj.y - self.y) <= range:
+                nearby_particles.append(obj)
+        return nearby_particles
+    
+
+class simulation:
+    def __init__(self, grid_obj):
+        self.grid = grid_obj
+        self.steps = 0
+        self.surface = pygame.display.set_mode((self.grid.x, self.grid.y))
+
+    def step(self):
+        for obj in self.grid.objects.values():
+            obj.step()
+    
+    def render(self):
+        self.grid.draw(self.surface)
+    
+    def simulate(self, steps):
+        self.render()
+        while self.steps < steps:
+            self.step()
+            self.render()
+            self.steps += 1
+
+if __name__ == "__main__":
+    g = grid(1000, 1000, background_color, grid_color, grid_size)
+    for i in range(100):
+        p = particle(randint(0, 1000), randint(0, 1000), (randint(0,255), randint(0,255), randint(0,255)), g, [
+            {'color': (randint(0,255), randint(0,255), randint(0,255)), 'strength': randint(-5,5), 'range': 50, 'colorrange': (randint(20,100), randint(20,100), randint(20,100))}
+        ])
+        g.add_object(p)
+    
+    sim = simulation(g)
+
+    sim.simulate(1000)
