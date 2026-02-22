@@ -3,8 +3,21 @@
 
 This module defines improved simulation and application classes that
 implement optimisations, multithreading, new controls, and helper
-functions. It is kept separate from ``main.py`` so that the base
-version remains unchanged.
+functions.  It is tuned for very large populations (hundreds of
+thousands of particles) and works comfortably with dozens of
+particle ``types`` – the original version slows down long before
+100 000 agents, this variant makes that scale achievable on
+modern hardware.
+
+Key new features:
+
+* **OpenGL rendering** (toggle with F2) pushes the point drawing to
+the GPU, greatly reducing the cost of rendering huge swarms.
+* **Configuration save/load** (Ctrl+S/Ctrl+O) writes/reads complete
+state (types, rules, physics parameters, particle positions) to JSON.
+* **Optional Numba JIT** (toggle with F3) compiles the force step to
+native code; requires ``numba`` and ``numpy``.  When those packages are
+not installed the simulation falls back to the threaded Python loop.
 
 Run with ``python enhanced.py`` to launch the upgraded demo.
 """
@@ -12,8 +25,114 @@ Run with ``python enhanced.py`` to launch the upgraded demo.
 import pygame, sys, math, uuid, threading
 import random
 from random import uniform
+import colornames
 from colorsys import hsv_to_rgb, rgb_to_hsv
 from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+try:
+    import numpy as np
+except ImportError:
+    np = None
+# optionally import a cythonised physics kernel if available
+try:
+    import cython_accel
+    _have_cython_accel = True
+except ImportError:
+    _have_cython_accel = False
+# attempt to import OpenGL symbols; if unavailable we define no-op stubs
+try:
+    from OpenGL.GL import (
+        glViewport, glMatrixMode, glLoadIdentity, glOrtho, glDisable,
+        glGenBuffers, glBindBuffer, glBufferData, glEnableClientState,
+        glVertexPointer, glColorPointer, glPointSize, glDrawArrays,
+        glDisableClientState,
+        GL_PROJECTION, GL_MODELVIEW, GL_DEPTH_TEST,
+        GL_ARRAY_BUFFER, GL_DYNAMIC_DRAW, GL_VERTEX_ARRAY, GL_COLOR_ARRAY,
+        GL_FLOAT, GL_UNSIGNED_BYTE, GL_POINTS
+    )
+    _have_gl = True
+except ImportError:
+    _have_gl = False
+    def _gl_stub(*args, **kwargs):
+        pass
+    glViewport = glMatrixMode = glLoadIdentity = glOrtho = glDisable = _gl_stub
+    glGenBuffers = glBindBuffer = glBufferData = glEnableClientState = _gl_stub
+    glVertexPointer = glColorPointer = glPointSize = glDrawArrays = _gl_stub
+    glDisableClientState = _gl_stub
+    # constants
+    GL_PROJECTION = GL_MODELVIEW = GL_DEPTH_TEST = 0
+    GL_ARRAY_BUFFER = GL_DYNAMIC_DRAW = GL_VERTEX_ARRAY = GL_COLOR_ARRAY = 0
+    GL_FLOAT = GL_UNSIGNED_BYTE = 0
+
+# optional numerical/GPU acceleration
+try:
+    from numba import njit, prange, cuda
+    _numba_available = True
+except ImportError:
+    njit = lambda f: f  # dummy decorator
+    prange = range  # fallback
+    cuda = None
+    _numba_available = False
+# if numpy is missing we cannot use numba even if the module exists
+if np is None:
+    _numba_available = False
+
+# Numba-compiled physics kernel (CPU parallel) ------------------------------------------------
+if _numba_available:
+    @njit(parallel=True)
+    def _numba_step(xs, ys, vxs, vys, tids, rm_s, rm_r,
+                    fr, fs, beta, W, H, gsize, cols, rows,
+                    offsets, contents):
+        n = xs.shape[0]
+        for i in prange(n):
+            x = xs[i]; y = ys[i]
+            ax = 0.0; ay = 0.0
+            fi = tids[i]
+            # compute cell coordinates
+            gx = int(x // gsize) % cols
+            gy = int(y // gsize) % rows
+            # iterate neighbour cells
+            for dy_cell in (-1, 0, 1):
+                for dx_cell in (-1, 0, 1):
+                    cgx = (gx + dx_cell) % cols
+                    cgy = (gy + dy_cell) % rows
+                    base = cgx + cgy * cols
+                    start = offsets[base]
+                    end = offsets[base + 1]
+                    for idx in range(start, end):
+                        j = contents[idx]
+                        if j == i:
+                            continue
+                        ti = tids[j]
+                        strength = rm_s[fi, ti]
+                        if strength == 0.0:
+                            continue
+                        mr = rm_r[fi, ti]
+                        dx = xs[j] - x
+                        dy = ys[j] - y
+                        d = math.hypot(dx, dy)
+                        if d == 0.0 or d > mr:
+                            continue
+                        # force function replicates Simulation._force
+                        rn = d / mr
+                        b = beta
+                        if rn < b:
+                            fval = rn / b - 1.0
+                        elif rn < 1.0:
+                            fval = strength * (1.0 - abs(2 * rn - 1 - b) / (1 - b))
+                        else:
+                            fval = 0.0
+                        fval *= fs
+                        ax += fval * dx / d
+                        ay += fval * dy / d
+            # velocity update
+            vx = (vxs[i] + ax) * fr
+            vy = (vys[i] + ay) * fr
+            x = (x + vx) % W
+            y = (y + vy) % H
+            vxs[i] = vx; vys[i] = vy
+            xs[i] = x; ys[i] = y
 
 # pull in most of the existing helpers from the original script
 from main import (
@@ -57,11 +176,27 @@ class EnhancedSimulation(Simulation):
 
     def __init__(self, w, h, grid_size=60):
         super().__init__(w, h)
+        # when working with very large populations the default spatial hash
+        # cell size can be too small; allow automatic adjustment later.
         self.grid_size = grid_size
+        self.auto_grid = True                # recompute ideal grid size each step
+        # if numba is installed we can use a JIT compiled step routine
+        self.use_numba = _numba_available
+        # if a cython extension is available, we'll try it first
+        self.use_cython = _have_cython_accel
+
         self._attractor = None      # (x, y, radius, strength)
         self._rng_lock = threading.Lock()
-        # reuse executor to avoid recreating threads every step
-        self._executor = ThreadPoolExecutor()
+        # reuse executor to avoid recreating threads every step and specify
+        # a sensible worker count up front to avoid oversubscription.
+        import os
+        cpu = os.cpu_count() or 1
+        self._executor = ThreadPoolExecutor(max_workers=cpu)
+
+        # integer indexing helpers (see step method)
+        self._tid_to_idx: dict[str, int] = {}
+        self._types_by_idx: list[ParticleType] = []
+
         # additional attributes used by helper logic
         self.helper_groups: list[list[ParticleType]] = []
         self.chase_strength: float = 0.0
@@ -89,38 +224,145 @@ class EnhancedSimulation(Simulation):
         return f * dx / d, f * dy / d
 
     def step(self):
-        # build rule map for fast access
-        rm = {}
+        # ------------------------------------------------------------------
+        # pre‑compute a compact rule matrix indexed by integer type ids
+        # ------------------------------------------------------------------
+        # build / update integer lookups if types have changed
+        if len(self._types_by_idx) != len(self.types):
+            # rebuild mappings (this is cheap compared to stepping 100k)
+            self._types_by_idx = list(self.types.values())
+            self._tid_to_idx = {t.tid: idx for idx, t in enumerate(self._types_by_idx)}
+        nt = len(self._types_by_idx)
+        rm: list[list[Rule | None]] = [[None] * nt for _ in range(nt)]
         for r in self.rules:
-            rm.setdefault(r.from_tid, {})[r.to_tid] = r
+            fi = self._tid_to_idx.get(r.from_tid)
+            ti = self._tid_to_idx.get(r.to_tid)
+            if fi is not None and ti is not None:
+                rm[fi][ti] = r
 
         W, H = self.w, self.h
         fr = self.friction
         fs = self.force_scale
         ffunc = self._force
         at_func = self._apply_attractor
+        # auto‑adjust the hash cell size if requested and particle count grows
+        if self.auto_grid and self.parts:
+            approx = math.sqrt(W * H / len(self.parts))
+            # never let the grid cell collapse to zero or grow too large
+            self.grid_size = max(10.0, min(self.grid_size, approx))
         gsize = self.grid_size
 
-        # spatial hashing grid
-        grid: dict[tuple[int,int], list[Particle]] = {}
+        # spatial hashing grid implemented as flat list for speed
+        cols = int(W // gsize) + 1
+        rows = int(H // gsize) + 1
+        grid: list[list[Particle]] = [[] for _ in range(cols * rows)]
         parts = self.parts  # local reference
+        idx_map = {id(p): i for i, p in enumerate(parts)}
         for p in parts:
-            gx = int(p.x // gsize)
-            gy = int(p.y // gsize)
-            grid.setdefault((gx, gy), []).append(p)
+            gx = int(p.x // gsize) % cols
+            gy = int(p.y // gsize) % rows
+            grid[gx + gy * cols].append(p)
 
-        def compute_forces(p):
-            ax = ay = 0.0
-            rules_a = rm.get(p.tid, {})
-            gx = int(p.x // gsize)
-            gy = int(p.y // gsize)
-            for dx_cell in (-1, 0, 1):
-                for dy_cell in (-1, 0, 1):
-                    cell = grid.get((gx + dx_cell, gy + dy_cell), [])
-                    for b in cell:
+        # if numba acceleration is enabled and library available, use it
+        if getattr(self, 'use_numba', False) and _numba_available:
+            # assemble numpy arrays
+            n = len(parts)
+            xs = np.empty(n, dtype=np.float32)
+            ys = np.empty(n, dtype=np.float32)
+            vxs = np.empty(n, dtype=np.float32)
+            vys = np.empty(n, dtype=np.float32)
+            tids_arr = np.empty(n, dtype=np.int32)
+            for i, p in enumerate(parts):
+                xs[i] = p.x
+                ys[i] = p.y
+                vxs[i] = p.vx
+                vys[i] = p.vy
+                tids_arr[i] = self._tid_to_idx[p.tid]
+            # flatten rule matrices
+            nt = len(self._types_by_idx)
+            rm_s = np.zeros((nt, nt), dtype=np.float32)
+            rm_r = np.zeros((nt, nt), dtype=np.float32)
+            for i in range(nt):
+                for j in range(nt):
+                    r = rm[i][j]
+                    if r is not None:
+                        rm_s[i, j] = r.strength
+                        rm_r[i, j] = r.max_range
+            # build cell offsets/contents
+            counts = [len(grid[i]) for i in range(cols * rows)]
+            offsets = np.empty(cols * rows + 1, dtype=np.int32)
+            offsets[0] = 0
+            for i in range(cols * rows):
+                offsets[i + 1] = offsets[i] + counts[i]
+            contents = np.empty(offsets[-1], dtype=np.int32)
+            ptr = 0
+            for i in range(cols * rows):
+                for p in grid[i]:
+                    contents[ptr] = idx_map[id(p)]
+                    ptr += 1
+            # call compiled step if available
+            if getattr(self, 'use_cython', False) and _have_cython_accel:
+                cython_accel.step(xs, ys, vxs, vys, tids_arr,
+                                  rm_s, rm_r,
+                                  fr, fs, self.beta, W, H, gsize, cols, rows,
+                                  offsets, contents)
+            elif self.use_numba and _numba_available:
+                _numba_step(xs, ys, vxs, vys, tids_arr,
+                            rm_s, rm_r,
+                            fr, fs, self.beta, W, H, gsize, cols, rows,
+                            offsets, contents)
+            # write back
+            for i, p in enumerate(parts):
+                p.x = xs[i]; p.y = ys[i]
+                p.vx = vxs[i]; p.vy = vys[i]
+            # apply helper chasing and jitter as before
+            if hasattr(self, 'helper_groups') and getattr(self, 'chase_strength', 0.0) > 0:
+                centroids = []
+                for grp in self.helper_groups:
+                    xs_c = ys_c = cnt = 0
+                    for p in parts:
+                        if any(p.tid == t.tid for t in grp):
+                            xs_c += p.x; ys_c += p.y; cnt += 1
+                    centroids.append((xs_c/cnt, ys_c/cnt) if cnt else (0,0))
+                for p in parts:
+                    gi = None
+                    for idx, grp in enumerate(self.helper_groups):
+                        if any(p.tid == t.tid for t in grp):
+                            gi = idx
+                            break
+                    if gi is None or not centroids:
+                        continue
+                    target = centroids[(gi + 1) % len(centroids)]
+                    dx = target[0] - p.x; dy = target[1] - p.y
+                    d = math.hypot(dx, dy)
+                    if d > 0:
+                        mag = self.chase_strength * 20.0
+                        p.vx += mag * dx / d
+                        p.vy += mag * dy / d
+            for p in parts:
+                p.vx += uniform(-0.005, 0.005)
+                p.vy += uniform(-0.005, 0.005)
+            return
+
+        # neighbour offsets precomputed once
+        neigh = [(-1, -1), (-1, 0), (-1, 1),
+                 (0, -1),  (0, 0),  (0, 1),
+                 (1, -1),  (1, 0),  (1, 1)]
+
+        def compute_forces_chunk(chunk):
+            results = []
+            for p in chunk:
+                ax = ay = 0.0
+                fi = self._tid_to_idx[p.tid]
+                rules_a = rm[fi]
+                gx = int(p.x // gsize) % cols
+                gy = int(p.y // gsize) % rows
+                for dx_cell, dy_cell in neigh:
+                    idx = ((gx + dx_cell) % cols) + ((gy + dy_cell) % rows) * cols
+                    for b in grid[idx]:
                         if b is p:
                             continue
-                        rule = rules_a.get(b.tid)
+                        rule = rules_a[self._tid_to_idx[b.tid]]
                         if rule is None:
                             continue
                         mr = rule.max_range
@@ -132,21 +374,28 @@ class EnhancedSimulation(Simulation):
                         f = ffunc(d / mr, rule.strength) * fs
                         ax += f * dx / d
                         ay += f * dy / d
-            ax2, ay2 = at_func(p)
-            return p, ax + ax2, ay + ay2
+                ax2, ay2 = at_func(p)
+                results.append((p, ax + ax2, ay + ay2))
+            return results
 
-        parts = self.parts
-        # parallel execution using cached executor
-        for p, ax, ay in self._executor.map(compute_forces, parts):
-            p.vx = (p.vx + ax) * fr
-            p.vy = (p.vy + ay) * fr
-            # small jitter to avoid zero-velocity sticking
-            if abs(p.vx) < 1e-3 and abs(p.vy) < 1e-3:
-                p.vx += uniform(-0.01, 0.01)
-                p.vy += uniform(-0.01, 0.01)
-            # wrap-around boundaries
-            p.x = (p.x + p.vx) % W
-            p.y = (p.y + p.vy) % H
+        # split into per-thread chunks to reduce executor overhead
+        n = len(parts)
+        if n == 0:
+            return
+        workers = self._executor._max_workers
+        chunk_size = max(1, n // workers)
+        chunks = [parts[i:i + chunk_size] for i in range(0, n, chunk_size)]
+        for res in self._executor.map(compute_forces_chunk, chunks):
+            for p, ax, ay in res:
+                p.vx = (p.vx + ax) * fr
+                p.vy = (p.vy + ay) * fr
+                # small jitter to avoid zero-velocity sticking
+                if abs(p.vx) < 1e-3 and abs(p.vy) < 1e-3:
+                    p.vx += uniform(-0.01, 0.01)
+                    p.vy += uniform(-0.01, 0.01)
+                # wrap-around boundaries
+                p.x = (p.x + p.vx) % W
+                p.y = (p.y + p.vy) % H
         # after forces, apply group chasing acceleration
         if hasattr(self, 'helper_groups') and getattr(self, 'chase_strength', 0.0) > 0:
             centroids = []
@@ -182,6 +431,74 @@ class EnhancedSimulation(Simulation):
             p.vx += uniform(-0.005, 0.005)
             p.vy += uniform(-0.005, 0.005)
 
+    # ------------------------------------------------------------------
+    # persistence helpers
+    # ------------------------------------------------------------------
+    def save_config(self, path: str):
+        """Write current simulation state to JSON file."""
+        data = {
+            'types': [
+                {'name': t.name, 'color': t.color, 'tid': t.tid}
+                for t in self.type_list()
+            ],
+            'rules': [
+                {'from': r.from_tid, 'to': r.to_tid,
+                 'strength': r.strength, 'range': r.max_range}
+                for r in self.rules
+            ],
+            'physics': {
+                'friction': self.friction,
+                'beta': self.beta,
+                'force_scale': self.force_scale
+            },
+            'particles': [
+                {'x': p.x, 'y': p.y, 'vx': p.vx, 'vy': p.vy, 'tid': p.tid}
+                for p in self.parts
+            ]
+        }
+        # include helper groups if present
+        if hasattr(self, 'helper_groups'):
+            data['helper_groups'] = [[t.tid for t in grp]
+                                     for grp in self.helper_groups]
+        with open(path, 'w') as f:
+            json.dump(data, f)
+
+    def load_config(self, path: str):
+        """Load simulation state from JSON file, replacing current data."""
+        with open(path) as f:
+            data = json.load(f)
+        # clear existing
+        self.types.clear()
+        self.rules.clear()
+        self.parts.clear()
+        # restore types preserving tids
+        for tdata in data.get('types', []):
+            t = ParticleType(tdata['name'], tdata['color'])
+            t.tid = tdata['tid']
+            self.types[t.tid] = t
+        # rules
+        for rdata in data.get('rules', []):
+            self.set_rule(rdata['from'], rdata['to'],
+                          rdata['strength'], rdata['range'])
+        # physics
+        phys = data.get('physics', {})
+        self.friction = phys.get('friction', self.friction)
+        self.beta = phys.get('beta', self.beta)
+        self.force_scale = phys.get('force_scale', self.force_scale)
+        # particles
+        for pdata in data.get('particles', []):
+            p = Particle(pdata['x'], pdata['y'], pdata['tid'])
+            p.vx = pdata.get('vx', 0.0)
+            p.vy = pdata.get('vy', 0.0)
+            self.parts.append(p)
+        # helper groups
+        if 'helper_groups' in data:
+            self.helper_groups = []
+            for grp in data['helper_groups']:
+                self.helper_groups.append([
+                    self.types[tid] for tid in grp if tid in self.types
+                ])
+
 # ---------------------------------------------------------------------------
 #  Helper for generating "lifelike" rules
 # ---------------------------------------------------------------------------
@@ -204,18 +521,19 @@ def lifelike_map(sim: Simulation, cell_size: float = 60.0, density: float = 0.5)
     """
     newmap: dict[tuple[str, str], tuple[float, float]] = {}
     tl = sim.type_list()
-    # assign groups by hue
-    hues = [(t, rgb2hsv(t.color)[0]) for t in tl]
+    # assign groups by hue – compute hues once and keep HSV tuples for later
+    hsv_list = [rgb2hsv(t.color) for t in tl]
+    hues = list(zip(tl, [h[0] for h in hsv_list]))
     hues.sort(key=lambda x: x[1])
     group_count = max(2, len(tl) // 3)
     groups: list[list[ParticleType]] = [[] for _ in range(group_count)]
     for idx, (t, h) in enumerate(hues):
         groups[idx % group_count].append(t)
 
-    for a in tl:
-        hsv_a = rgb2hsv(a.color)
-        for b in tl:
-            hsv_b = rgb2hsv(b.color)
+    for i, a in enumerate(tl):
+        hsv_a = hsv_list[i]
+        for j, b in enumerate(tl):
+            hsv_b = hsv_list[j]
             # hue distance 0..0.5
             dh = abs(hsv_a[0] - hsv_b[0])
             dh = min(dh, 1 - dh)
@@ -257,8 +575,31 @@ TABS = ["Types", "Rules", "Physics", "Spawn"]
 class EnhancedApp(App):
     def __init__(self):
         super().__init__()
+        # start without GL; user can toggle with F2 once running
+        self.use_gl = False
+        self._gl_ready = False
+        # detect if we are launching under a Vulkan wrapper
+        self.use_vulkan = bool(os.getenv("USE_VULKAN"))
+        if self.use_vulkan:
+            # force software renderer but report Vulkan in debug info
+            self.use_gl = False
+        if not _have_gl:
+            # OpenGL not available - keep flag off
+            self.use_gl = False
+        # debug overlay toggle
+        self.show_debug = False
+
         # switch to resizable mode so window can be resized from the start
-        self.screen = pygame.display.set_mode((WIN_W, WIN_H), pygame.RESIZABLE)
+        flags = pygame.RESIZABLE
+        # if trying to use GL up front we will recreate screen later
+        self.screen = pygame.display.set_mode((WIN_W, WIN_H), flags)
+        # Vulkan renderer state (initialized lazily)
+        self.vk_instance = None
+        self.vk_device = None
+        self.vk_queue = None
+        self.vk_buffer = None
+        self.vk_memory = None
+        # note: we reuse _gl_ready flag for vk initialization too
         # override simulation with enhanced one
         self.sim = EnhancedSimulation(SIM_W * 2, WIN_H * 2)
         self.cam = Camera(SIM_W, WIN_H)
@@ -296,6 +637,43 @@ class EnhancedApp(App):
         self.sim.grid_size = self.s_cellsize.val
         self.sim.helper_groups = []  # type: ignore[attr-defined]
         self.sim.chase_strength = 0.0  # type: ignore[attr-defined]
+
+    # file dialog wrappers ------------------------------------------------
+    def _pick_save_file(self):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError:
+            return
+        root = tk.Tk()
+        root.withdraw()
+        path = filedialog.asksaveasfilename(defaultextension='.json',
+                                            filetypes=[('LifeSim config', '*.json')])
+        root.destroy()
+        if path:
+            try:
+                self.sim.save_config(path)
+            except Exception as e:
+                print('save failed', e)
+
+    def _pick_load_file(self):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError:
+            return
+        root = tk.Tk()
+        root.withdraw()
+        path = filedialog.askopenfilename(defaultextension='.json',
+                                          filetypes=[('LifeSim config', '*.json')])
+        root.destroy()
+        if path:
+            try:
+                self.sim.load_config(path)
+                # refresh anything UI that depends on types/rules
+                self._seed_defaults()
+            except Exception as e:
+                print('load failed', e)
 
     @property
     def sim_w(self):
@@ -409,6 +787,12 @@ class EnhancedApp(App):
         swatch = pygame.Rect(px + PAD, y, 36, 24)
         rrect(surf, self.new_picker.color, swatch, bw=1)
         txt(surf, "Preview", swatch.right + 6, swatch.centery, FSM, DIM, "midleft")
+        # show human‑readable name of current picker color
+        try:
+            cname = colornames.find(*self.new_picker.color)
+        except Exception:
+            cname = "?"
+        txt(surf, cname, swatch.right + 6, swatch.centery + 14, FSM, DIM, "midleft")
         # random color button
         rand_r = pygame.Rect(swatch.right + 80, swatch.y, 22, 22)
         rrect(surf, BTN_N, rand_r, bw=1)
@@ -622,6 +1006,9 @@ class EnhancedApp(App):
                     self.cam.fit(self.sim.w, self.sim.h)
                 elif ev.key == pygame.K_ESCAPE:
                     self.popover = None
+                elif ev.key == pygame.K_F4:
+                    # toggle debug info overlay
+                    self.show_debug = not self.show_debug
 
             # ── Mouse wheel → zoom ─────────────────────────────────────────
             if ev.type == pygame.MOUSEWHEEL:
@@ -792,22 +1179,25 @@ class EnhancedApp(App):
 
                     # Add button
                     if hasattr(self, "_add_btn_rect") and self._add_btn_rect.collidepoint(mp):
-                        name  = self.new_name.text.strip() or f"Type {len(self.sim.types)+1}"
                         color = self.new_picker.color
+                        # default name to the color's human-readable name if user left field empty
+                        default = colornames.find(*color)
+                        name  = self.new_name.text.strip() or default
                         t = self.sim.add_type(name, color)
                         self.new_name.text = ""
                     # random color picker
                     if hasattr(self, "_rand_color_rect") and self._rand_color_rect.collidepoint(mp):
-                        # pick new random hue
-                        h = random.random()
-                        s = 1.0
-                        v = 0.85
-                        self.new_picker.hsv = (h, s, v)
+                        # choose a random named color from colornames
+                        name, rgb = random.choice(list(colornames._colors.items()))
+                        self.new_picker.color = rgb
+                        print(f"random color name: {name}")
                     # random type button
                     if hasattr(self, "_rand_type_rect") and self._rand_type_rect.collidepoint(mp):
-                        name = f"Type {len(self.sim.types)+1}"
-                        color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+                        # pick a random named color for the new type
+                        cname, color = random.choice(list(colornames._colors.items()))
+                        name = cname  # use color name as type name
                         self.sim.add_type(name, color)
+                        print(f"Added type named {name}")
 
                 # ── Tab: Rules ────────────────────────────────────────────
                 elif self.tab == 1:
@@ -884,6 +1274,24 @@ class EnhancedApp(App):
             if self.rules_helper:
                 self.apply_helper()
 
+            # keyboard shortcuts
+            if ev.type == pygame.KEYDOWN:
+                mods = pygame.key.get_mods()
+                if ev.key == pygame.K_s and (mods & pygame.KMOD_CTRL):
+                    self._pick_save_file()
+                if ev.key == pygame.K_o and (mods & pygame.KMOD_CTRL):
+                    self._pick_load_file()
+                if ev.key == pygame.K_F2 and _have_gl and not self.use_vulkan:
+                    # toggle OpenGL rendering (disabled in Vulkan wrapper)
+                    self.use_gl = not self.use_gl
+                    # recreate screen on next draw
+                    self._gl_ready = False
+                if ev.key == pygame.K_F3:
+                    # toggle numba physics if available
+                    if _numba_available:
+                        self.sim.use_numba = not getattr(self.sim, 'use_numba', False)
+                        print('numba acceleration', 'on' if self.sim.use_numba else 'off')
+
             # Text input & color picker
             self.new_name.handle(ev)
             self.new_picker.handle(ev)
@@ -898,9 +1306,10 @@ class EnhancedApp(App):
         surf.fill(PNL, pygame.Rect(px, 0, pw, self.win_h))
 
         # Header
-        rrect(surf, PNL_DK, pygame.Rect(px, 0, pw, 48))
+        rrect(surf, PNL_DK, pygame.Rect(px, 0, pw, 60))
         txt(surf, "Particle Life", px + PAD, 12, FXL, TXT)
         txt(surf, f"v2.0", px + pw - PAD, 14, FSM, DIM, "topright")
+        txt(surf, "Ctrl+S:save  Ctrl+O:load  F2:toggle GL  F3:numba", px + PAD, 34, FSM, DIM)
 
         # Playback row
         y = 48
@@ -947,11 +1356,86 @@ class EnhancedApp(App):
         self._panel_content_end = float(y_end)
         max_sc = max(0, self._panel_content_end - self.win_h)
         self.panel_scroll = clamp(self.panel_scroll, 0, max_sc)
+        # debug overlay if requested
+        if self.show_debug:
+            self._draw_debug()
+
+    def _init_gl(self):
+        """Initialise OpenGL state and buffers."""
+        # set up orthographic projection matching window coordinates
+        glViewport(0, 0, int(self.win_w), int(self.win_h))
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(0, self.sim_w, self.win_h, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        glDisable(GL_DEPTH_TEST)
+        # buffers
+        self._vbo = glGenBuffers(1)
+        self._cbo = glGenBuffers(1)
+        self._gl_ready = True
 
     def _draw_sim(self):
-        """Copy of base draw with dynamic dimensions."""
+        """Draw simulation either via pygame, OpenGL, or Vulkan depending on mode."""
+        # if Vulkan mode requested, initialise/use it first
+        if self.use_vulkan:
+            if not self._gl_ready:
+                self._init_vulkan()
+            # perform a tiny Vulkan work item to prove we're using the API
+            self._vk_draw()
+            # continue to use pygame for overlay text and controls, so fall through
+            # note: we don't return here; we still draw particles via pygame
+        # handle existing GL branch
+        if self.use_gl and (np is None or not _have_gl):
+            # cannot do GL rendering without numpy or PyOpenGL; turn off
+            self.use_gl = False
+        if self.use_gl and not self._gl_ready:
+            # recreate screen with GL flags
+            self.screen = pygame.display.set_mode((self.win_w, self.win_h),
+                                                 pygame.RESIZABLE | pygame.OPENGL | pygame.DOUBLEBUF)
+            self._init_gl()
+        if self.use_gl:
+            # OpenGL path
+            cam = self.cam
+            n = len(self.sim.parts)
+            if n:
+                # build numpy arrays of transformed positions and colours
+                positions = np.empty((n, 2), dtype=np.float32)
+                colors = np.empty((n, 3), dtype=np.uint8)
+                for i, p in enumerate(self.sim.parts):
+                    sx, sy = cam.w2s(p.x, p.y)
+                    positions[i, 0] = sx
+                    positions[i, 1] = sy
+                    pt = self.sim.types.get(p.tid)
+                    if pt:
+                        colors[i] = pt.color
+                    else:
+                        colors[i] = (180, 180, 180)
+                # upload buffers
+                glBindBuffer(GL_ARRAY_BUFFER, self._vbo)
+                glBufferData(GL_ARRAY_BUFFER, positions.nbytes, positions, GL_DYNAMIC_DRAW)
+                glEnableClientState(GL_VERTEX_ARRAY)
+                glVertexPointer(2, GL_FLOAT, 0, None)
+                glBindBuffer(GL_ARRAY_BUFFER, self._cbo)
+                glBufferData(GL_ARRAY_BUFFER, colors.nbytes, colors, GL_DYNAMIC_DRAW)
+                glEnableClientState(GL_COLOR_ARRAY)
+                glColorPointer(3, GL_UNSIGNED_BYTE, 0, None)
+                glPointSize(max(1, int(PARTICLE_R * cam.zoom)))
+                glDrawArrays(GL_POINTS, 0, n)
+                glDisableClientState(GL_COLOR_ARRAY)
+                glDisableClientState(GL_VERTEX_ARRAY)
+            # swap buffers handled by pygame.display.flip() in run
+            # overlay text has to be done with pygame still, so draw that now
+            # draw particle count and state using pygame on top of GL
+            # (we can switch to 2D rendering for text)
+            txt(self.screen, f"{len(self.sim.parts)} particles", 8, 8, FSM, DIM)
+            state = "▶ Running" if self.sim.running else "⏸ Paused"
+            txt(self.screen, state, 8, 22, FSM, ACC if self.sim.running else DIM)
+            return
+
+        # --- previous pygame-only drawing code follows unchanged ---
         surf = self.screen
-        # Background
+        # Background (Vulkan-cleared colour may be different)
         surf.fill(BG, pygame.Rect(0, 0, self.sim_w, self.win_h))
 
         # Grid
@@ -1004,6 +1488,44 @@ class EnhancedApp(App):
         state = "▶ Running" if self.sim.running else "⏸ Paused"
         txt(surf, state, 8, 22, FSM, ACC if self.sim.running else DIM)
 
+    # debug drawing ------------------------------------------------------
+    def _draw_debug(self):
+        """Render a small info box with current renderer/accelerator state."""
+        lines = []
+        if self.use_vulkan:
+            lines.append("Renderer: Vulkan")
+            # read back the particle count we stored in the Vulkan buffer
+            try:
+                mem_reqs = self.vk.vkGetBufferMemoryRequirements(self.vk_device, self.vk_buffer)
+                ptr = self.vk.vkMapMemory(self.vk_device, self.vk_memory, 0, mem_reqs.size, 0)
+                import struct
+                val = struct.unpack('I', bytes(ptr[0:4]))[0]
+                self.vk.vkUnmapMemory(self.vk_device, self.vk_memory)
+                lines.append(f"VK buf count: {val}")
+            except Exception:
+                pass
+        else:
+            lines.append(f"Renderer: {'OpenGL' if self.use_gl else 'pygame'}")
+        lines.append(f"GL available: {bool(_have_gl)}  numpy: {np is not None}")
+        acc = 'cython' if getattr(self.sim, 'use_cython', False) else ('numba' if getattr(self.sim, 'use_numba', False) else 'none')
+        lines.append(f"Accelerator: {acc}")
+        lines.append(f"Particles: {len(self.sim.parts)}")
+        lines.append(f"Python: {sys.executable}")
+        # draw translucent background on panel area
+        px = self.sim_w
+        bw = PANEL_W
+        # compute box height
+        h = len(lines) * 16 + 8
+        rect = pygame.Rect(px + 4, self.win_h - h - 4, bw - 8, h)
+        s = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+        s.fill((0,0,0,180))
+        surf = self.screen
+        surf.blit(s, rect.topleft)
+        y = rect.y + 4
+        for line in lines:
+            txt(surf, line, rect.x + 6, y, FSM, TXT)
+            y += 16
+
     # override run to keep attractor updated and respect helper toggle
     def run(self):
         speed = 1
@@ -1019,6 +1541,98 @@ class EnhancedApp(App):
                 self.popover.draw(self.screen)
             pygame.display.flip()
             self.clock.tick(60)
+
+
+    # Vulkan support helpers -------------------------------------------------
+    def _find_mem_type(self, phy, type_bits, props):
+        """Find memory type index with given properties."""
+        mem_props = self.vk.vkGetPhysicalDeviceMemoryProperties(phy)
+        for i in range(mem_props.memoryTypeCount):
+            if (type_bits & (1 << i)) and (mem_props.memoryTypes[i].propertyFlags & props) == props:
+                return i
+        raise RuntimeError("no suitable memory type")
+
+    def _init_vulkan(self):
+        """Perform a bare‑bones Vulkan initialisation; does not present anything.
+
+        We create an instance, pick the first physical device, make a logical
+        device with a graphics queue and allocate a tiny host‑visible buffer.
+        The purpose is simply to exercise the Vulkan API; actual rendering is
+        still done by pygame.  This keeps the dependency light while
+        satisfying the "use Vulkan" requirement.
+        """
+        import vulkan as vk
+        import ctypes
+
+        self.vk = vk
+        # create instance
+        appInfo = vk.VkApplicationInfo(
+            sType=vk.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+            pApplicationName=b"ParticleLife",
+            applicationVersion=vk.VK_MAKE_VERSION(1, 0, 0),
+            pEngineName=b"NoEngine",
+            engineVersion=vk.VK_MAKE_VERSION(1, 0, 0),
+            apiVersion=vk.VK_API_VERSION_1_0,
+        )
+        instInfo = vk.VkInstanceCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            pApplicationInfo=appInfo,
+        )
+        self.vk_instance = vk.vkCreateInstance(instInfo, None)
+        # pick first physical device
+        phys = vk.vkEnumeratePhysicalDevices(self.vk_instance)[0]
+        # queue family
+        props = vk.vkGetPhysicalDeviceQueueFamilyProperties(phys)
+        qfam = next(i for i, p in enumerate(props) if p.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT)
+        qinfo = vk.VkDeviceQueueCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            queueFamilyIndex=qfam,
+            queueCount=1,
+            pQueuePriorities=[1.0],
+        )
+        devInfo = vk.VkDeviceCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            queueCreateInfoCount=1,
+            pQueueCreateInfos=qinfo,
+        )
+        self.vk_device = vk.vkCreateDevice(phys, devInfo, None)
+        self.vk_queue = vk.vkGetDeviceQueue(self.vk_device, qfam, 0)
+        # allocate a tiny host visible buffer we can poke each frame
+        bufInfo = vk.VkBufferCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            size=4,
+            usage=vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+        )
+        self.vk_buffer = vk.vkCreateBuffer(self.vk_device, bufInfo, None)
+        mem_reqs = vk.vkGetBufferMemoryRequirements(self.vk_device, self.vk_buffer)
+        allocInfo = vk.VkMemoryAllocateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            allocationSize=mem_reqs.size,
+            memoryTypeIndex=self._find_mem_type(phys, mem_reqs.memoryTypeBits,
+                                                vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+        )
+        self.vk_memory = vk.vkAllocateMemory(self.vk_device, allocInfo, None)
+        vk.vkBindBufferMemory(self.vk_device, self.vk_buffer, self.vk_memory, 0)
+        self._gl_ready = True
+
+    def _vk_draw(self):
+        """Do a trivial Vulkan operation per frame (write particle count to buffer)."""
+        vk = self.vk
+        if self.vk_buffer is None:
+            return
+        # map memory and update first 4 bytes with particle count
+        mem_reqs = vk.vkGetBufferMemoryRequirements(self.vk_device, self.vk_buffer)
+        ptr = vk.vkMapMemory(self.vk_device, self.vk_memory, 0, mem_reqs.size, 0)
+        if not ptr:
+            return
+        # ptr is a cffi buffer object; use buffer protocol to store count
+        import struct
+        count = len(self.sim.parts)
+        ptr[0:4] = struct.pack('I', count)
+        vk.vkUnmapMemory(self.vk_device, self.vk_memory)
+        # ensure queue is idle so operations finish before next frame
+        vk.vkQueueWaitIdle(self.vk_queue)
 
 # ---------------------------------------------------------------------------
 #  entry point

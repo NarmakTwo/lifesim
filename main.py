@@ -178,10 +178,16 @@ class Simulation:
         cx = cx if cx is not None else self.w / 2
         cy = cy if cy is not None else self.h / 2
         sp = spread if spread is not None else min(self.w, self.h) * 0.4
+        # pre‑allocate local names for loop speed
+        parts = []
+        c1 = clamp
+        u1 = uniform
+        w, h = self.w, self.h
         for _ in range(count):
-            x = clamp(cx + uniform(-sp, sp), 0, self.w)
-            y = clamp(cy + uniform(-sp, sp), 0, self.h)
-            self.parts.append(Particle(x, y, tid))
+            x = c1(cx + u1(-sp, sp), 0, w)
+            y = c1(cy + u1(-sp, sp), 0, h)
+            parts.append(Particle(x, y, tid))
+        self.parts.extend(parts)
 
     def clear(self):
         self.parts.clear()
